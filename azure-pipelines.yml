@@ -7,7 +7,7 @@ trigger:
 - master
 
 pool:
-  vmImage: 'PennState-dotnet-linux-agent'
+  vmImage: 'ubuntu-latest'
 
 steps:
 - script: echo Hello, world!
