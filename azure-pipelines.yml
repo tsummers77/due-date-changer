@@ -3,17 +3,207 @@
 # Add steps that build, run tests, deploy, and more:
 # https://aka.ms/yaml
 
+pool:
+  name: PennState-dotnet-linux-agent
+  vmImage: 'ubuntu-latest'
+
+#Your build pipeline references the ‘ddc.docker.tag’ variable, which you’ve selected to be settable at queue time. Create or edit the build pipeline for this YAML file, define the variable on the Variables tab, and then select the option to make it settable at queue time. See https://go.microsoft.com/fwlink/?linkid=865971
+#Your build pipeline references the ‘ddc.docker.tag’ variable, which you’ve selected to be settable at queue time. Create or edit the build pipeline for this YAML file, define the variable on the Variables tab, and then select the option to make it settable at queue time. See https://go.microsoft.com/fwlink/?linkid=865971
+variables:
+  ddc.docker.imageName: 'dotnet/due-date-changer'
+
+steps:
+- script: |
+   # Set application scheme to HTTPS
+   # Notes:
+   # - Due to the load balancer, the application is unaware that the scheme of incoming requests is HTTPS.
+   # - The scheme is being explicitly set here
+   sed -i "s/return redirect(url_for('show_assignments', course_id=course_id))/return redirect(url_for('show_assignments', _external=True, _scheme='https', course_id=course_id))/" ./lti.py
+   
+   
+   
+  displayName: 'Set application scheme to HTTPS'
+
+- script: |
+   # Correct Python3 breaking change
+   sed -i "s/iteritems/items/" ./lti.py
+  displayName: 'Correct Python3 Breaking Change'
+
+- script: |
+   # Remove console.log()
+   sed -i '53d' ./templates/base.htm.j2
+   
+   # Remove UCF copyright info from base page
+   sed -i '35d' ./templates/base.htm.j2
+  displayName: 'Remove UCF copyright info'
+
+- script: |
+   # log to stdout
+   sed -i '122 a \ \ \ \ app.logger.info("entering show_assignments ho ho ho")' lti.py
+   sed -i '68 a \ \ \ \ app.logger.info("entering index ho ho ho")' lti.py
+   sed -i '31 a app.logger.addHandler(handler)' lti.py
+   sed -i '31 a handler = logging.StreamHandler(sys.stdout)' lti.py
+   sed -i '31 a \ \ \ \ app.run(host="0.0.0.0", port=8080, debug=True)' lti.py
+   sed -i '31 a if __name__ == "__main__":' lti.py
+   sed -i '31 a \ \ \ \ app.logger.setLevel(gunicorn_logger.level)' lti.py
+   sed -i '31 a \ \ \ \ app.logger.handlers = gunicorn_logger.handlers' lti.py
+   sed -i '31 a \ \ \ \ gunicorn_logger = logging.getLogger("gunicorn.error")' lti.py
+   sed -i '31 a if __name__ != "__main__":' lti.py
+   sed -i '23,31d' lti.py
+   sed -i '1 a import sys' lti.py
+   
+   cat lti.py
+  displayName: 'Add debugging to lti.py'
+
+- script: |
+   # add a StreamHandler for sys.stdout
+   sed -i '32 a shandler = StreamHandler(stream="sys.stdout")' lti.py
+   sed -i '33 a shandler.setLevel(logging.getLevelName(config.LOG_LEVEL))' lti.py
+   sed -i '34 a shandler.setFormatter(formatter)' lti.py
+   sed -i '35 a app.logger.addHandler(shandler)' lti.py
+   
+   cat lti.py
+  displayName: 'Send log messages to stdout'
+  enabled: false
+
+- script: |
+   echo "# -*- coding: utf-8 -*-
+   from __future__ import unicode_literals
+   import os
+   
+   DEBUG = True 
+   SECRET_KEY = os.urandom(24)
+   
+   ALLOWED_CANVAS_DOMAINS = [os.environ.get('CANVAS_URL').split('https://')[1]] 
+   
+   CANVAS_URL = os.environ.get('CANVAS_URL')
+   API_KEY = os.environ.get('CANVAS_ACCESS_TOKEN') # Note that the variable name, API_KEY, is misleading. The expected value here is a Canvas access token. -- apn114, 9/16/2019
+   
+   PYLTI_CONFIG = { 
+       'consumers': { 
+           os.environ.get('CONSUMER_KEY'): { 
+               'secret': os.environ.get('SHARED_SECRET').encode()
+           } 
+       }, 
+       'roles': { 
+           'staff': [ 
+               'urn:lti:instrole:ims/lis/Administrator', 
+               'Instructor', 
+               'ContentDeveloper', 
+               'urn:lti:role:ims/lis/TeachingAssistant' 
+           ] 
+       } 
+   } 
+   
+   TIME_ZONE = 'US/Eastern' 
+   LOCAL_TIME_FORMAT = '%m/%d/%Y %I:%M %p' 
+   
+   LOG_FILE = 'due_date_changer.log'
+   LOG_FORMAT = '%(asctime)s [%(levelname)s] {%(filename)s:%(lineno)d} %(message)s' 
+   LOG_LEVEL = 'DEBUG' 
+   LOG_MAX_BYTES = 1024 * 1024 * 5  # 5 MB 
+   LOG_BACKUP_COUNT = 1
+   " > ./config.py
+   
+   cat ./config.py
+  displayName: 'Generate application configuration file'
+
+- script: |
+   # Generate nginx_default.conf
+   # Notes:
+   # - proxy_pass directs all traffic to gunicorn
+   echo "
+   server {
+       location /static { 
+           alias /var/www/html/static/; 
+       } 
+   
+       location / { 
+           proxy_pass http://0.0.0.0:8080;
+           proxy_redirect               off; 
+           proxy_set_header             Host \$host; 
+           proxy_set_header             X-Real-IP \$remote_addr; 
+           proxy_set_header             X-Forwarded-For \$proxy_add_x_forwarded_for; 
+       }
+   }
+   " > ./nginx_default.conf
+  displayName: 'Generate Nginx configuration file'
+
+- script: |
+   # Generate app.start
+   # Note on the application workflow:
+   # - Due Date Changer is designed to be run in Python Flask
+   # - Gunicorn is used to serve the Flask application
+   # - Nginx will proxy all requests to Gunicorn
+   echo '#!/bin/sh
+   gunicorn -b 0.0.0.0:8080 lti:app --daemon
+   nginx -g "daemon off;"
+   ' > ./app.start
+  displayName: 'Generate application start file'
+
+- script: |
+   echo "FROM nginx:stable-alpine
+   
+   RUN apk --no-cache --update add \
+       git \
+       python3 \
+       py3-gunicorn && \
+       if [ ! -e /usr/bin/pip ]; then ln -s pip3 /usr/bin/pip ; fi && \
+       if [[ ! -e /usr/bin/python ]]; then ln -sf /usr/bin/python3 /usr/bin/python; fi && \
+       pip install --upgrade pip && \
+       pip install requests canvasapi pylti pytz flask
+   
+   COPY ./nginx_default.conf /etc/nginx/conf.d/default.conf
+   
+   RUN mkdir -p /var/www/html/
+   
+   COPY . /var/www/html/
+   
+   WORKDIR /var/www/html/
+   
+   RUN chmod +x /var/www/html/app.start
+   
+   RUN pip install -r requirements.txt
+   
+   ENTRYPOINT [\"/var/www/html/app.start\"]
+   " > nginx-flask.Dockerfile
+  displayName: 'Generate Docker container'
+
+- task: Docker@2
+  displayName: 'Build Docker container'
+  inputs:
+    containerRegistry: Nexus
+    repository: '$(ddc.docker.imageName)'
+    Dockerfile: 'nginx-flask.Dockerfile'
+    buildContext: '$(build.sourcesDirectory)'
+    tags: '$(ddc.docker.tag)'
+
+- script: |
+   echo ==============================================================================
+   echo Clean-up Docker image
+   echo Remove $(ddc.docker.imageName) and nginx:stable-alpine
+   echo ==============================================================================
+   docker rmi $(ddc.docker.repositoryUrl)/$(ddc.docker.imageName):$(ddc.docker.tag)
+   docker rmi $(ddc.docker.repositoryUrl)/$(ddc.docker.imageName):latest
+   docker rmi $(ddc.docker.repositoryUrl)/$(ddc.docker.imageName)
+   docker rmi nginx:stable-alpine
+   
+   echo ==============================================================================
+   echo Let\'s verify that Due Date Changer is no longer in the Docker registry
+   echo ==============================================================================
+   echo List available docker containers
+   echo ==============================================================================
+   docker container ls -a
+   
+   echo ==============================================================================
+   echo List available docker images
+   echo ==============================================================================
+   docker images 
+   
+  displayName: 'Clean-up Docker image'
+
+
 trigger:
 - master
 
-pool:
-  vmImage: 'ubuntu-latest'
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
-
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
