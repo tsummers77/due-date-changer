@@ -8,59 +8,321 @@ pool:
   vmImage: 'ubuntu-latest'
 
 #Your build pipeline references the ‘ddc.docker.tag’ variable, which you’ve selected to be settable at queue time. Create or edit the build pipeline for this YAML file, define the variable on the Variables tab, and then select the option to make it settable at queue time. See https://go.microsoft.com/fwlink/?linkid=865971
-#Your build pipeline references the ‘ddc.docker.tag’ variable, which you’ve selected to be settable at queue time. Create or edit the build pipeline for this YAML file, define the variable on the Variables tab, and then select the option to make it settable at queue time. See https://go.microsoft.com/fwlink/?linkid=865971
 
 steps:
 - script: |
-   # Set application scheme to HTTPS
-   # Notes:
-   # - Due to the load balancer, the application is unaware that the scheme of incoming requests is HTTPS.
-   # - The scheme is being explicitly set here
-   sed -i "s/return redirect(url_for('show_assignments', course_id=course_id))/return redirect(url_for('show_assignments', _external=True, _scheme='https', course_id=course_id))/" ./lti.py
-   
-   
-   
-  displayName: 'Set application scheme to HTTPS'
+    from collections import defaultdict
+    import sys
+    from datetime import datetime
+    import json
+    import logging
+    from logging.handlers import RotatingFileHandler
+    import re
+    
+    import requests
+    
+    from flask import Flask, redirect, render_template, request, url_for, Response
+    from canvasapi import Canvas
+    from canvasapi.user import User
+    from canvasapi.exceptions import CanvasException
+    from pylti.flask import lti
+    from pytz import utc, timezone
+    
+    import config
+    
+    
+    app = Flask(__name__)
+    app.config.from_object('config')
+    
+    if __name__ != "__main__":
+        gunicorn_logger = logging.getLogger("gunicorn.error")
+        app.logger.handlers = gunicorn_logger.handlers
+        app.logger.setLevel(gunicorn_logger.level)
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=8080, debug=True)
+    handler = logging.StreamHandler(sys.stdout)
+    app.logger.addHandler(handler)
+    
+    canvas = Canvas(config.CANVAS_URL, config.API_KEY)
+    
+    
+    def error(exception=None):
+        return Response(
+            render_template(
+                'error.htm.j2',
+                message=exception.get(
+                    'exception',
+                    'Please contact your System Administrator.'
+                )
+            )
+        )
+    
+    
+    @app.route('/launch', methods=['GET', 'POST'])
+    @lti(error=error, request='initial', role='staff', app=app)
+    def launch(lti=lti):
+        canvas_domain = request.values.get('custom_canvas_api_domain')
+        if canvas_domain not in config.ALLOWED_CANVAS_DOMAINS:
+            msg = (
+                '<p>This tool is only available from the following domain(s):<br/>{}</p>'
+                '<p>You attempted to access from this domain:<br/>{}</p>'
+            )
+            return render_template(
+                'error.htm.j2',
+                message=msg.format(', '.join(config.ALLOWED_CANVAS_DOMAINS), canvas_domain),
+            )
+    
+        course_id = request.form.get('custom_canvas_course_id')
+    
+        return redirect(url_for('show_assignments', course_id=course_id))
+    
+    
+    @app.route('/', methods=['GET'])
+    def index(lti=lti):
+        app.logger.info("entering index ho ho ho")
+        return "Please contact your System Administrator."
+    
+    
+    @app.route('/status', methods=['GET'])
+    def status():
+        """
+        Runs smoke tests and reports status
+        """
+        status = {
+            'tool': 'Due Date Changer',
+            'checks': {
+                'index': False,
+                'xml': False,
+                'api_key': False,
+            },
+            'url': url_for('index', _external=True),
+            'xml_url': url_for('xml', _external=True),
+            'canvas_url': config.CANVAS_URL,
+            'debug': app.debug
+        }
+    
+        # Check index
+        try:
+            response = requests.get(url_for('index', _external=True), verify=False)
+            status['checks']['index'] = response.text == 'Please contact your System Administrator.'
+        except Exception as e:
+            app.logger.exception('Index check failed.')
+    
+        # Check xml
+        try:
+            response = requests.get(url_for('xml', _external=True), verify=False)
+            status['checks']['xml'] = 'application/xml' in response.headers.get('Content-Type')
+        except Exception as e:
+            app.logger.exception('XML check failed.')
+    
+        # Check API Key
+        try:
+            self_user = canvas.get_user('self')
+            status['checks']['api_key'] = isinstance(self_user, User)
+        except Exception as e:
+            app.logger.exception('API check failed.')
+    
+        # Overall health check - if all checks are True
+        status['healthy'] = all(v is True for k, v in status['checks'].items())
+    
+        return Response(
+            json.dumps(status),
+            mimetype='application/json'
+        )
+    
+    
+    @app.route('/course/<course_id>/assignments', methods=['GET'])
+    @lti(error=error, request='session', role='staff', app=app)
+    def show_assignments(course_id, lti=lti):
+        app.logger.info("entering show_assignments ho ho ho")
+        try:
+            course = canvas.get_course(course_id)
+            assignments = course.get_assignments()
+            quiz_dict = {quiz.id: quiz for quiz in course.get_quizzes()}
+        except CanvasException as err:
+            app.logger.exception(
+                'Error getting course, assignments or quizzes from Canvas.'
+            )
+            return error({'exception': err})
+    
+        assignment_quiz_list = []
+        try:
+            for assignment in assignments:
+                if hasattr(assignment, 'quiz_id'):
+                    quiz = quiz_dict.get(assignment.quiz_id)
+                    if hasattr(quiz, 'show_correct_answers_at_date'):
+                        assignment.show_correct_answers_at_date = datetime_localize(
+                            quiz.show_correct_answers_at_date
+                        )
+                    if hasattr(quiz, 'hide_correct_answers_at_date'):
+                        assignment.hide_correct_answers_at_date = datetime_localize(
+                            quiz.hide_correct_answers_at_date
+                        )
+                assignment_quiz_list.append(assignment)
+        except CanvasException as err:
+            app.logger.exception('Error getting assignments from Canvas.')
+            return error({'exception': err})
+    
+        return render_template(
+            'assignments.htm.j2',
+            assignments=assignment_quiz_list,
+            course=course
+        )
+    
+    
+    @app.route('/course/<course_id>/update', methods=['POST'])
+    @lti(error=error, request='session', role='staff', app=app)
+    def update_assignments(course_id, lti=lti):
+    
+        def fix_date(value):
+            try:
+                value = datetime.strptime(value, config.LOCAL_TIME_FORMAT)
+                value = local_tz.localize(value)
+                return value.isoformat()
+            except (ValueError, TypeError):
+                # Not a valid time. Just ignore.
+                return ''
+    
+        def error_json(assignment_id, updated_list):
+            msg = 'There was an error editing one of the assignments. (ID: {})'
+            msg = msg.format(assignment_id)
+            if len(updated_list) > 0:
+                '{} {} assignments have been updated successfully.'.format(
+                    msg,
+                    len(updated_list)
+                )
+    
+            return Response(
+                json.dumps({
+                    'error': True,
+                    'message': msg,
+                    'updated': updated_list,
+                }),
+                mimetype='application/json'
+            )
+    
+        if not request.is_xhr:
+            return render_template('error.htm.j2', message='Non-AJAX requests not allowed.')
+    
+        try:
+            course = canvas.get_course(course_id)
+        except CanvasException:
+            msg = 'Error getting course #{}.'.format(course_id)
+            app.logger.exception(msg)
+            return Response(
+                json.dumps({
+                    'error': True,
+                    'message': msg,
+                    'updated': []
+                }),
+                mimetype='application/json'
+            )
+    
+        post_data = request.form
+    
+        local_tz = timezone(config.TIME_ZONE)
+        assignment_field_map = defaultdict(dict)
+    
+        for key, value in post_data.iteritems():
+            if not re.match(r'\d+-[a-z_]+', key):
+                continue
+    
+            assignment_id, field_name = key.split('-')
+            assignment_field_map[assignment_id].update({field_name: value})
+    
+        if len(assignment_field_map) < 1:
+            return Response(
+                json.dumps({
+                    'error': True,
+                    'message': 'There were no assignments to update.',
+                    'updated': []
+                }),
+                mimetype='application/json'
+            )
+    
+        updated_list = []
+        for assignment_id, field in assignment_field_map.iteritems():
+            assignment_type = field.get('assignment_type', 'assignment')
+            quiz_id = field.get('quiz_id')
+    
+            payload = {
+                'published': field.get('published') == 'on',
+                'due_at': fix_date(field.get('due_at')),
+                'lock_at': fix_date(field.get('lock_at')),
+                'unlock_at': fix_date(field.get('unlock_at')),
+            }
+    
+            if assignment_type == 'quiz' and quiz_id:
+                payload.update({
+                    'show_correct_answers_at': fix_date(
+                        field.get('show_correct_answers_at')
+                    ),
+                    'hide_correct_answers_at': fix_date(
+                        field.get('hide_correct_answers_at')
+                    )
+                })
+    
+                try:
+                    quiz = course.get_quiz(quiz_id)
+                    quiz.edit(quiz=payload)
+                    updated_list.append({
+                        'id': assignment_id,
+                        'title': quiz.title,
+                        'type': 'Quiz'
+                    })
+                except CanvasException:
+                    app.logger.exception('Error getting/editing quiz #{}.'.format(
+                        quiz_id
+                    ))
+    
+                    return error_json(assignment_id, updated_list)
+    
+            else:
+                try:
+                    assignment = course.get_assignment(assignment_id)
+                    assignment.edit(assignment=payload)
+                    updated_list.append({
+                        'id': assignment_id,
+                        'title': assignment.name,
+                        'type': 'Assignment'
+                    })
+                except CanvasException:
+                    app.logger.exception('Error getting/editing assignment #{}.'.format(
+                        assignment_id
+                    ))
+    
+                    return error_json(assignment_id, updated_list)
+    
+        return Response(
+            json.dumps({
+                'error': False,
+                'message': 'Successfully updated {} assignments.'.format(len(updated_list)),
+                'updated': updated_list,
+            }),
+            mimetype='application/json'
+        )
+    
+    
+    @app.route('/lti.xml', methods=['GET'])
+    def xml():
+        return Response(
+            render_template('lti.xml.j2'),
+            mimetype='application/xml'
+        )
+    
+    
+    @app.template_filter()
+    def datetime_localize(utc_datetime, format=config.LOCAL_TIME_FORMAT):
+        if not utc_datetime.tzinfo:
+            # Localize to UTC if there is no timezone information.
+            utc_datetime = utc.localize(utc_datetime)
+    
+        new_tz = timezone(config.TIME_ZONE)
+        local_datetime = utc_datetime.astimezone(new_tz)
+    
+        return local_datetime.strftime(format)
+    
 
-- script: |
-   # Correct Python3 breaking change
-   sed -i "s/iteritems/items/" ./lti.py
-  displayName: 'Correct Python3 Breaking Change'
-
-- script: |
-   # Remove console.log()
-   sed -i '53d' ./templates/base.htm.j2
-   
-   # Remove UCF copyright info from base page
-   sed -i '35d' ./templates/base.htm.j2
-  displayName: 'Remove UCF copyright info'
-
-- script: |
-   # log to stdout
-   sed -i '122 a \ \ \ \ app.logger.info("entering show_assignments ho ho ho")' lti.py
-   sed -i '68 a \ \ \ \ app.logger.info("entering index ho ho ho")' lti.py
-   sed -i '31 a app.logger.addHandler(handler)' lti.py
-   sed -i '31 a handler = logging.StreamHandler(sys.stdout)' lti.py
-   sed -i '31 a \ \ \ \ app.run(host="0.0.0.0", port=8080, debug=True)' lti.py
-   sed -i '31 a if __name__ == "__main__":' lti.py
-   sed -i '31 a \ \ \ \ app.logger.setLevel(gunicorn_logger.level)' lti.py
-   sed -i '31 a \ \ \ \ app.logger.handlers = gunicorn_logger.handlers' lti.py
-   sed -i '31 a \ \ \ \ gunicorn_logger = logging.getLogger("gunicorn.error")' lti.py
-   sed -i '31 a if __name__ != "__main__":' lti.py
-   sed -i '23,31d' lti.py
-   sed -i '1 a import sys' lti.py
-   
-   cat lti.py
-  displayName: 'Add debugging to lti.py'
-
-- script: |
-   # add a StreamHandler for sys.stdout
-   sed -i '32 a shandler = StreamHandler(stream="sys.stdout")' lti.py
-   sed -i '33 a shandler.setLevel(logging.getLevelName(config.LOG_LEVEL))' lti.py
-   sed -i '34 a shandler.setFormatter(formatter)' lti.py
-   sed -i '35 a app.logger.addHandler(shandler)' lti.py
-   
-   cat lti.py
   displayName: 'Send log messages to stdout'
   enabled: false
 
@@ -138,34 +400,6 @@ steps:
    nginx -g "daemon off;"
    ' > ./app.start
   displayName: 'Generate application start file'
-
-- script: |
-   echo "FROM nginx:stable-alpine
-   
-   RUN apk --no-cache --update add \
-       git \
-       python3 \
-       py3-gunicorn && \
-       if [ ! -e /usr/bin/pip ]; then ln -s pip3 /usr/bin/pip ; fi && \
-       if [[ ! -e /usr/bin/python ]]; then ln -sf /usr/bin/python3 /usr/bin/python; fi && \
-       pip install --upgrade pip && \
-       pip install requests canvasapi pylti pytz flask
-   
-   COPY ./nginx_default.conf /etc/nginx/conf.d/default.conf
-   
-   RUN mkdir -p /var/www/html/
-   
-   COPY . /var/www/html/
-   
-   WORKDIR /var/www/html/
-   
-   RUN chmod +x /var/www/html/app.start
-   
-   RUN pip install -r requirements.txt
-   
-   ENTRYPOINT [\"/var/www/html/app.start\"]
-   " > nginx-flask.Dockerfile
-  displayName: 'Generate Docker container'
 
 - task: Docker@2
   displayName: 'Build Docker container'
